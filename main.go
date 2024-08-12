@@ -2,10 +2,11 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
-	"io"
 
 	"github.com/Puneet-Pal-Singh/go-redis/redisprotocol"
 )
@@ -28,7 +29,6 @@ type Server struct {
 	commands   map[string]CommandFunc
 }
 
-
 func NewServer() *Server {
 	s := &Server{
 		kvstore:  NewKeyValueStore(),
@@ -42,6 +42,14 @@ func (s *Server) registerCommands() {
     s.commands = map[string]CommandFunc{
         "GET":    s.handleGet,
         "SET":    s.handleSet,
+		"DEL":    s.handleDel,
+        "EXISTS": s.handleExists,
+        "INCR":   s.handleIncr,
+        "DECR":   s.handleDecr,
+        "INCRBY": s.handleIncrBy,
+        "DECRBY": s.handleDecrBy,
+		"MSET":   s.handleMSet,
+		"MGET":   s.handleMGet,
         //TODO: More commands will be added here
     }
 }
@@ -72,41 +80,123 @@ func (s *Server) handleSet(args []string) string {
 	return "OK"
 }
 
-func (s *Server) ExecuteCommand(input string) string {
-    args := strings.Fields(input)
-    if len(args) == 0 {
-        return "ERR empty command"
+func (s *Server) handleDel(args []string) string {
+    if len(args) < 1 {
+        return "ERROR 'DEL' command requires at least 1 argument"
     }
-
-    command := strings.ToUpper(args[0])
-    if cmd, ok := s.commands[command]; ok {
-        return cmd(args[1:])
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+    deletedCount := 0
+    for _, key := range args {
+        if _, exists := s.kvstore.Strings[key]; exists {
+            delete(s.kvstore.Strings, key)
+            deletedCount++
+        }
     }
-    return "ERR unknown command '" + command + "'"
+    return fmt.Sprintf("(integer) %d", deletedCount)
 }
 
-func handleConnection(conn net.Conn, server *Server) {
-    defer conn.Close()
-    resp := redisprotocol.NewResp(conn, conn)
+func (s *Server) handleExists(args []string) string {
+    if len(args) != 1 {
+        return "ERROR 'EXISTS' command requires 1 argument"
+    }
+    s.kvstore.RLock()
+    defer s.kvstore.RUnlock()
+    if _, exists := s.kvstore.Strings[args[0]]; exists {
+        return ":1"
+    }
+    return ":0"
+}
 
-    for {
-        command, err := readCommand(resp)
-        if err != nil {
-            if err == io.EOF {
-                fmt.Println("Client disconnected")
-                return
-            }
-            fmt.Println("Error reading command:", err)
-            return
-        }
+func (s *Server) handleIncr(args []string) string {
+    return s.handleIncrDecr(args, 1)
+}
 
-        response := server.processCommand(command)
-        err = resp.Write(redisprotocol.Value{Type: "bulk", Bulk: response})
-        if err != nil {
-            fmt.Println("Error writing response:", err)
-            return
+func (s *Server) handleDecr(args []string) string {
+    return s.handleIncrDecr(args, -1)
+}
+
+func (s *Server) handleIncrDecr(args []string, delta int64) string {
+    if len(args) != 1 {
+        return fmt.Sprintf("ERROR '%s' command requires 1 argument", strings.ToUpper(args[0]))
+    }
+    key := args[0]
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+    value, exists := s.kvstore.Strings[key]
+    if !exists {
+        s.kvstore.Strings[key] = "0"
+        value = "0"
+    }
+    intValue, err := strconv.ParseInt(value, 10, 64)
+    if err != nil {
+        return "ERROR value is not an integer or out of range"
+    }
+    intValue += delta
+    s.kvstore.Strings[key] = strconv.FormatInt(intValue, 10)
+    return fmt.Sprintf("(integer) %d", intValue)
+}
+
+func (s *Server) handleIncrBy(args []string) string {
+    return s.handleIncrDecrBy(args)
+}
+
+func (s *Server) handleDecrBy(args []string) string {
+    return s.handleIncrDecrBy(args)
+}
+
+func (s *Server) handleIncrDecrBy(args []string) string {
+    if len(args) != 2 {
+        return fmt.Sprintf("ERROR '%s' command requires 2 arguments", strings.ToUpper(args[0]))
+    }
+    key := args[0]
+    delta, err := strconv.ParseInt(args[1], 10, 64)
+    if err != nil {
+        return "ERROR increment/decrement value is not an integer"
+    }
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+    value, exists := s.kvstore.Strings[key]
+    if !exists {
+        s.kvstore.Strings[key] = "0"
+        value = "0"
+    }
+    intValue, err := strconv.ParseInt(value, 10, 64)
+    if err != nil {
+        return "ERROR value is not an integer or out of range"
+    }
+    intValue += delta
+    s.kvstore.Strings[key] = strconv.FormatInt(intValue, 10)
+    return fmt.Sprintf("(integer) %d", intValue)
+}
+
+func (s *Server) handleMSet(args []string) string {
+    if len(args)%2 != 0 {
+        return "ERROR 'MSET' command requires an even number of arguments"
+    }
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+    for i := 0; i < len(args); i += 2 {
+        s.kvstore.Strings[args[i]] = args[i+1]
+    }
+    return "OK"
+}
+
+func (s *Server) handleMGet(args []string) string {
+    if len(args) < 1 {
+        return "ERROR 'MGET' command requires at least 1 argument"
+    }
+    s.kvstore.RLock()
+    defer s.kvstore.RUnlock()
+    results := make([]string, len(args))
+    for i, key := range args {
+        if value, exists := s.kvstore.Strings[key]; exists {
+            results[i] = value
+        } else {
+            results[i] = "(nil)"
         }
     }
+    return strings.Join(results, "\n")
 }
 
 func readCommand(resp *redisprotocol.Resp) ([]string, error) {
@@ -131,6 +221,7 @@ func readCommand(resp *redisprotocol.Resp) ([]string, error) {
 }
 
 func (s *Server) processCommand(command []string) string {
+    fmt.Println("Received command:", command) // yo
     if len(command) == 0 {
         return "ERR empty command"
     }
@@ -143,6 +234,30 @@ func (s *Server) processCommand(command []string) string {
 	}
 
 	return "ERR unknown command '" + cmd + "'"
+}
+
+func handleConnection(conn net.Conn, server *Server) {
+    defer conn.Close()
+    resp := redisprotocol.NewResp(conn, conn)
+
+    for {
+        command, err := readCommand(resp)
+        if err != nil {
+            if err == io.EOF {
+                fmt.Println("Client disconnected")
+                return
+            }
+            fmt.Println("Error reading command:", err)
+            return
+        }
+
+        response := server.processCommand(command)
+        err = resp.Write(redisprotocol.Value{Type: "bulk", Bulk: response})
+        if err != nil {
+            fmt.Println("Error writing response:", err)
+            return
+        }
+    }
 }
 
 func main() {
