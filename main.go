@@ -251,8 +251,8 @@ func (s *Server) handleLLen(args []string) string {
     s.kvstore.RLock()
     defer s.kvstore.RUnlock()
 
-    if value, exists := s.kvstore.Strings[key]; exists {
-        return fmt.Sprintf("(integer) %d", len(strings.Split(value, ","))-1)
+    if list, exists := s.kvstore.Lists[key]; exists {
+        return fmt.Sprintf("(integer) %d", len(list))
     }
     return "(integer) 0"
 }
@@ -266,14 +266,14 @@ func (s *Server) handleRPush(args []string) string {
     defer s.kvstore.Unlock()
 
     // Initialize the list if it doesn't exist
-    if _, exists := s.kvstore.Strings[key]; !exists {
-        s.kvstore.Strings[key] = ""
+    if _, exists := s.kvstore.Lists[key]; !exists {
+        s.kvstore.Lists[key] = make([]string, 0)
     }
+    values := args[1:]
     // Append the new values to the list
-    for _, value := range args[1:] {
-        s.kvstore.Strings[key] += value + ","
-    }
-    return fmt.Sprintf("(integer) %d", len(strings.Split(s.kvstore.Strings[key], ","))-1)
+    s.kvstore.Lists[key] = append(s.kvstore.Lists[key], values...)
+    
+    return fmt.Sprintf("(integer) %d", len(s.kvstore.Lists[key]))
 }
 
 func (s *Server) handleRPop(args []string) string {
@@ -284,11 +284,10 @@ func (s *Server) handleRPop(args []string) string {
     s.kvstore.Lock()
     defer s.kvstore.Unlock()
 
-    if value, exists := s.kvstore.Strings[key]; exists && value != "" {
-        elements := strings.Split(value, ",")
-        poppedValue := elements[len(elements)-2] // Get the last element
+    if value, exists := s.kvstore.Lists[key]; exists && len(value) > 0 {
+        poppedValue := value[len(value)-1] // Get the last element
         // Remove the last element
-        s.kvstore.Strings[key] = strings.Join(elements[:len(elements)-1], ",")
+        s.kvstore.Lists[key] = value[:len(value)-1]
         return poppedValue
     }
     return "(nil)"
