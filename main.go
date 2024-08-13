@@ -13,12 +13,14 @@ import (
 
 type KeyValueStore struct {
 	Strings               map[string]string
+    Lists                 map[string][]string
 	sync.RWMutex
 }
 
 func NewKeyValueStore() *KeyValueStore {
 	return &KeyValueStore{
 		Strings:               make(map[string]string),
+        Lists:                 make(map[string][]string),
 	}
 }
 
@@ -50,6 +52,12 @@ func (s *Server) registerCommands() {
         "DECRBY": s.handleDecrBy,
 		"MSET":   s.handleMSet,
 		"MGET":   s.handleMGet,
+        // Lists
+        "LPUSH":  s.handleLPush,
+        "LPOP":   s.handleLPop,
+        "LLEN":   s.handleLLen,
+        "RPUSH":  s.handleRPush,
+        "RPOP":   s.handleRPop,
         //TODO: More commands will be added here
     }
 }
@@ -199,6 +207,94 @@ func (s *Server) handleMGet(args []string) string {
     return strings.Join(results, "\n")
 }
 
+func (s *Server) handleLPush(args []string) string {
+    if len(args) < 2 {
+        return "ERROR 'LPUSH' command requires at least 2 arguments"
+    }
+    key := args[0]
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+    
+    // Initialize the list if it doesn't exist
+    if _, exists := s.kvstore.Lists[key]; !exists {
+        s.kvstore.Lists[key] = make([]string, 0)
+    }
+    // Prepend the new values to the list
+    for _, value := range args[1:] {
+        s.kvstore.Lists[key] = append([]string{value}, s.kvstore.Lists[key]...)
+    }
+    return fmt.Sprintf("(integer) %d", len(s.kvstore.Lists[key]))
+}
+
+func (s *Server) handleLPop(args []string) string {
+    if len(args) != 1 {
+        return "ERROR 'LPOP' command requires 1 argument"
+    }
+    key := args[0]
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+
+    if list, exists := s.kvstore.Lists[key]; exists && len(list) > 0 {
+        poppedValue := list[0]
+        // Remove the first element
+        s.kvstore.Lists[key] = s.kvstore.Lists[key][1:]
+        return poppedValue
+    }
+    return "(nil)"
+}
+
+func (s *Server) handleLLen(args []string) string {
+    if len(args) != 1 {
+        return "ERROR 'LLEN' command requires 1 argument"
+    }
+    key := args[0]
+    s.kvstore.RLock()
+    defer s.kvstore.RUnlock()
+
+    if value, exists := s.kvstore.Strings[key]; exists {
+        return fmt.Sprintf("(integer) %d", len(strings.Split(value, ","))-1)
+    }
+    return "(integer) 0"
+}
+
+func (s *Server) handleRPush(args []string) string {
+    if len(args) < 2 {
+        return "ERROR 'RPUSH' command requires at least 2 arguments"
+    }
+    key := args[0]
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+
+    // Initialize the list if it doesn't exist
+    if _, exists := s.kvstore.Strings[key]; !exists {
+        s.kvstore.Strings[key] = ""
+    }
+    // Append the new values to the list
+    for _, value := range args[1:] {
+        s.kvstore.Strings[key] += value + ","
+    }
+    return fmt.Sprintf("(integer) %d", len(strings.Split(s.kvstore.Strings[key], ","))-1)
+}
+
+func (s *Server) handleRPop(args []string) string {
+    if len(args) != 1 {
+        return "ERROR 'RPOP' command requires 1 argument"
+    }
+    key := args[0]
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+
+    if value, exists := s.kvstore.Strings[key]; exists && value != "" {
+        elements := strings.Split(value, ",")
+        poppedValue := elements[len(elements)-2] // Get the last element
+        // Remove the last element
+        s.kvstore.Strings[key] = strings.Join(elements[:len(elements)-1], ",")
+        return poppedValue
+    }
+    return "(nil)"
+}
+
+// TODO: Add more commands
 func readCommand(resp *redisprotocol.Resp) ([]string, error) {
     value, err := resp.Read()
     if err != nil {
