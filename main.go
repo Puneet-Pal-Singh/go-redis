@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,8 @@ type KeyValueStore struct {
 	Strings               map[string]string
     Lists                 map[string][]string
     Hashes                map[string]map[string]string
+    Sets                  map[string]map[string]struct{}
+    SortedSets            map[string]map[string]float64
 	sync.RWMutex
 }
 
@@ -23,6 +26,8 @@ func NewKeyValueStore() *KeyValueStore {
 		Strings:               make(map[string]string),
         Lists:                 make(map[string][]string),
         Hashes:                make(map[string]map[string]string),
+        Sets:                  make(map[string]map[string]struct{}),
+        SortedSets:            make(map[string]map[string]float64),
 	}
 }
 
@@ -67,6 +72,15 @@ func (s *Server) registerCommands() {
         "HLEN":   s.handleHLen,
         "HMGET":  s.handleHMGet,
         "HGETALL": s.handleHGetAll,
+        // Sets
+        "SADD":   s.handleSAdd,
+        "SREM":   s.handleSRem,
+        "SMEMBERS": s.handleSMembers,
+        "SISMEMBER": s.handleSIsMember,
+        // Sorted Sets
+        "ZADD":   s.handleZAdd,
+        "ZRANGE": s.handleZRange,
+        "ZREM":   s.handleZRem,
         //TODO: More commands will be added here
     }
 }
@@ -443,6 +457,188 @@ func (s *Server) handleHGetAll(args []string) string {
         return strings.Join(result, "\n")
     }
     return "(empty)"
+}
+
+func (s *Server) handleSAdd(args []string) string {
+    if len(args) < 2 {
+        return "ERROR 'SADD' command requires at least 2 arguments"
+    }
+    key := args[0]
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+
+    if _, exists := s.kvstore.Sets[key]; !exists {
+        s.kvstore.Sets[key] = make(map[string]struct{})
+    }
+
+    addedCount := 0
+    for _, member := range args[1:] {
+        if _, exists := s.kvstore.Sets[key][member]; !exists {
+            s.kvstore.Sets[key][member] = struct{}{}
+            addedCount++
+        }
+    }
+    return fmt.Sprintf("(integer) %d", addedCount)
+}
+
+func (s *Server) handleSRem(args []string) string {
+    if len(args) < 2 {
+        return "ERROR 'SREM' command requires at least 2 arguments"
+    }
+    key := args[0]
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+
+    if _, exists := s.kvstore.Sets[key]; !exists {
+        return "(integer) 0"
+    }
+
+    removedCount := 0
+    for _, member := range args[1:] {
+        if _, exists := s.kvstore.Sets[key][member]; exists {
+            delete(s.kvstore.Sets[key], member)
+            removedCount++
+        }
+    }
+    return fmt.Sprintf("(integer) %d", removedCount)
+}
+
+func (s *Server) handleSMembers(args []string) string {
+    if len(args) != 1 {
+        return "ERROR 'SMEMBERS' command requires 1 argument"
+    }
+    key := args[0]
+    s.kvstore.RLock()
+    defer s.kvstore.RUnlock()
+
+    if memberSet, exists := s.kvstore.Sets[key]; exists {
+        result := make([]string, 0, len(memberSet))
+        for member := range memberSet {
+            result = append(result, member)
+        }
+        sort.Strings(result)  // Sort the slice
+        return strings.Join(result, "\n")
+    }
+    return "(empty)"
+}
+
+func (s *Server) handleSIsMember(args []string) string {
+    if len(args) != 2 {
+        return "ERROR 'SISMEMBER' command requires 2 arguments"
+    }
+    key := args[0]
+    member := args[1]
+    s.kvstore.RLock()
+    defer s.kvstore.RUnlock()
+
+    if set, exists := s.kvstore.Sets[key]; exists {
+        if _, exists := set[member]; exists {
+            return "(integer) 1"
+        }
+    }
+    return "(integer) 0"
+}
+
+func (s *Server) handleZAdd(args []string) string {
+    if len(args) < 3 || len(args)%2 != 1 {
+        return "ERROR 'ZADD' command requires at least 3 arguments with score-member pairs"
+    }
+    key := args[0]
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+
+    if _, exists := s.kvstore.SortedSets[key]; !exists {
+        s.kvstore.SortedSets[key] = make(map[string]float64)
+    }
+
+    addedCount := 0
+    for i := 1; i < len(args)-1; i += 2 {
+        score, err := strconv.ParseFloat(args[i], 64)
+        if err != nil {
+            return "ERROR score is not a valid number"
+        }
+        member := args[i+1]
+        if _, exists := s.kvstore.SortedSets[key][member]; !exists {
+            s.kvstore.SortedSets[key][member] = score
+            addedCount++
+        }
+    }
+    return fmt.Sprintf("(integer) %d", addedCount)
+}
+
+func (s *Server) handleZRange(args []string) string {
+    if len(args) != 3 {
+        return "ERROR 'ZRANGE' command requires 3 arguments"
+    }
+    key := args[0]
+    start, err1 := strconv.Atoi(args[1])
+    end, err2 := strconv.Atoi(args[2])
+    s.kvstore.RLock()
+    defer s.kvstore.RUnlock()
+
+    if err1 != nil || err2 != nil {
+        return "ERROR start or end is not a valid integer"
+    }
+
+    if sortedSet, exists := s.kvstore.SortedSets[key]; exists {
+        // Create a slice to hold the members
+        var members []string
+        for member := range sortedSet {
+            members = append(members, member)
+        }
+
+        // Sort the members based on their scores
+        sort.Slice(members, func(i, j int) bool {
+            return sortedSet[members[i]] < sortedSet[members[j]]
+        })
+
+        // Adjust start and end for negative indexing
+        if start < 0 {
+            start = len(members) + start
+        }
+        if end < 0 {
+            end = len(members) + end
+        }
+        if start < 0 {
+            start = 0
+        }
+        if end >= len(members) {
+            end = len(members) - 1
+        }
+        if start > end {
+            return "(empty)"
+        }
+
+        // Prepare the result
+        result := make([]string, 0, end-start+1)
+        for i := start; i <= end; i++ {
+            result = append(result, fmt.Sprintf(`"%s"`, members[i]))
+        }
+        return strings.Join(result, "\n") // Return as separate lines
+    }
+    return "(empty)"
+}
+
+func (s *Server) handleZRem(args []string) string {
+    if len(args) < 2 {
+        return "ERROR 'ZREM' command requires at least 2 arguments"
+    }
+    key := args[0]
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+
+    if _, exists := s.kvstore.SortedSets[key]; !exists {
+        return "(integer) 0"
+    }
+
+    removedCount := 0
+    for _, member := range args[1:] {
+        if _, exists := s.kvstore.SortedSets[key][member]; exists {
+            delete(s.kvstore.SortedSets[key], member)
+            removedCount++
+        }
+    }
+    return fmt.Sprintf("(integer) %d", removedCount)
 }
 
 // TODO: Add more commands
