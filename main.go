@@ -14,6 +14,7 @@ import (
 type KeyValueStore struct {
 	Strings               map[string]string
     Lists                 map[string][]string
+    Hashes                map[string]map[string]string
 	sync.RWMutex
 }
 
@@ -21,6 +22,7 @@ func NewKeyValueStore() *KeyValueStore {
 	return &KeyValueStore{
 		Strings:               make(map[string]string),
         Lists:                 make(map[string][]string),
+        Hashes:                make(map[string]map[string]string),
 	}
 }
 
@@ -58,6 +60,13 @@ func (s *Server) registerCommands() {
         "LLEN":   s.handleLLen,
         "RPUSH":  s.handleRPush,
         "RPOP":   s.handleRPop,
+        // Hashes
+        "HSET":   s.handleHSet,
+        "HGET":   s.handleHGet,
+        "HDEL":   s.handleHDel,
+        "HLEN":   s.handleHLen,
+        "HMGET":  s.handleHMGet,
+        "HGETALL": s.handleHGetAll,
         //TODO: More commands will be added here
     }
 }
@@ -291,6 +300,149 @@ func (s *Server) handleRPop(args []string) string {
         return poppedValue
     }
     return "(nil)"
+}
+
+func (s *Server) handleHSet(args []string) string {
+    if len(args) < 3 || len(args)%2 != 1 {
+        return "ERROR 'HSET' command requires at least 3 arguments with key-value pairs"
+    }
+    key := args[0]
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+
+    // Initialize the hash if it doesn't exist
+    if _, exists := s.kvstore.Hashes[key]; !exists {
+        s.kvstore.Hashes[key] = make(map[string]string)
+    }
+
+    for i := 1; i < len(args)-1; i += 2 {
+        s.kvstore.Hashes[key][args[i]] = args[i+1]
+    }
+
+    return fmt.Sprintf("(integer) %d", len(s.kvstore.Hashes[key]))
+}
+
+func (s *Server) handleHGet(args []string) string {
+    if len(args) != 2 {
+        return "ERROR 'HGET' command requires 2 arguments"
+    }
+    key := args[0]
+    field := args[1]
+    s.kvstore.RLock()
+    defer s.kvstore.RUnlock()
+
+    if value, exists := s.kvstore.Hashes[key][field]; exists {
+        return value
+    }
+    return "(nil)"
+}
+
+func (s *Server) handleHDel(args []string) string {
+    if len(args) < 2 {
+        return "ERROR 'HDEL' command requires at least 2 arguments"
+    }
+    key := args[0]
+    fields := args[1:]
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+
+    if _, exists := s.kvstore.Hashes[key]; !exists {
+        return "(integer) 0"
+    }
+
+    count := 0
+    for _, field := range fields {
+        if _, exists := s.kvstore.Hashes[key][field]; exists {
+            delete(s.kvstore.Hashes[key], field)
+            count++
+        }
+    }
+
+    return fmt.Sprintf("(integer) %d", count)
+}
+
+func (s *Server) handleHLen(args []string) string {
+    if len(args) != 1 {
+        return "ERROR 'HLEN' command requires 1 argument"
+    }
+    key := args[0]
+    s.kvstore.RLock()
+    defer s.kvstore.RUnlock()
+
+    if fields, exists := s.kvstore.Hashes[key]; exists {
+        return fmt.Sprintf("(integer) %d", len(fields))
+    }
+    return "(integer) 0"
+}
+
+// func (s *Server) handleHMGet(args []string) string {
+//     if len(args) < 2 {
+//         return "ERROR 'HMGET' command requires at least 2 arguments"
+//     }
+//     key := args[0]
+//     fields := args[1:]
+//     s.kvstore.RLock()
+//     defer s.kvstore.RUnlock()
+
+//     if values, exists := s.kvstore.Hashes[key]; exists {
+//         var result []string
+//         for _, field := range fields {
+//             if value, fieldExists := values[field]; fieldExists {
+//                 result = append(result, value)
+//             } else {
+//                 result = append(result, "(nil)")
+//             }
+//         }
+//         return strings.Join(result, "\n")
+//     }
+//     return "(nil)"
+// }
+
+func (s *Server) handleHMGet(args []string) string {
+    if len(args) < 2 {
+        return "ERROR 'HMGET' command requires at least 2 arguments"
+    }
+    key := args[0]
+    fields := args[1:]
+    s.kvstore.RLock()
+    defer s.kvstore.RUnlock()
+
+    if values, exists := s.kvstore.Hashes[key]; exists {
+        var result []string
+        for i, field := range fields {
+            var value string
+            if val, fieldExists := values[field]; fieldExists {
+                value = fmt.Sprintf(`"%s"`, val)
+            } else {
+                value = "(nil)"
+            }
+            result = append(result, fmt.Sprintf("%d) %s", i+1, value))
+        }
+        return strings.Join(result, "\n")
+    }
+    return "(nil)"
+}
+
+func (s *Server) handleHGetAll(args []string) string {
+    if len(args) != 1 {
+        return "ERROR 'HGETALL' command requires 1 argument"
+    }
+    key := args[0]
+    s.kvstore.RLock()
+    defer s.kvstore.RUnlock()
+
+    if fields, exists := s.kvstore.Hashes[key]; exists {
+        var result []string
+        index := 1
+        for field, value := range fields {
+            result = append(result, fmt.Sprintf("%d) \"%s\"", index, field))
+            index++
+            result = append(result, fmt.Sprintf("%d) \"%s\"", index, value))
+            index++
+        }
+        return strings.Join(result, "\n")
+    }
+    return "(empty)"
 }
 
 // TODO: Add more commands
