@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-
+	"time"
 	"github.com/Puneet-Pal-Singh/go-redis/redisprotocol"
 )
 
@@ -18,6 +18,7 @@ type KeyValueStore struct {
     Hashes                map[string]map[string]string
     Sets                  map[string]map[string]struct{}
     SortedSets            map[string]map[string]float64
+    Expirations           map[string]time.Time
 	sync.RWMutex
 }
 
@@ -28,6 +29,7 @@ func NewKeyValueStore() *KeyValueStore {
         Hashes:                make(map[string]map[string]string),
         Sets:                  make(map[string]map[string]struct{}),
         SortedSets:            make(map[string]map[string]float64),
+        Expirations:           make(map[string]time.Time),
 	}
 }
 
@@ -81,6 +83,12 @@ func (s *Server) registerCommands() {
         "ZADD":   s.handleZAdd,
         "ZRANGE": s.handleZRange,
         "ZREM":   s.handleZRem,
+        // Server and connection commands
+        "EXPIRE": s.handleExpire,
+        "TTL": s.handleTTL,
+        "INFO": s.handleInfo,
+        "FLUSHALL": s.handleFlushAll,
+        "PING": s.handlePing,
         //TODO: More commands will be added here
     }
 }
@@ -639,6 +647,85 @@ func (s *Server) handleZRem(args []string) string {
         }
     }
     return fmt.Sprintf("(integer) %d", removedCount)
+}
+
+
+func (s *Server) handleExpire(args []string) string {
+    if len(args) != 2 {
+        return "ERROR 'EXPIRE' command requires 2 arguments"
+    }
+    key := args[0]
+    seconds, err := strconv.ParseInt(args[1], 10, 64)
+    if err != nil {
+        return "ERROR seconds must be a valid integer"
+    }
+    
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+    
+    if _, exists := s.kvstore.Strings[key]; exists {
+        s.kvstore.Expirations[key] = time.Now().Add(time.Duration(seconds) * time.Second) // Set expiration time
+        return "OK"
+    }
+    return "(nil)"
+}
+
+func (s *Server) handleTTL(args []string) string {
+    if len(args) != 1 {
+        return "ERROR 'TTL' command requires 1 argument"
+    }
+    key := args[0]
+
+    s.kvstore.RLock()
+    expiration, exists := s.kvstore.Expirations[key]
+    s.kvstore.RUnlock()
+    
+    if exists {
+        if time.Now().Before(expiration) {
+            // Calculate remaining TTL
+            ttl := int(time.Until(expiration).Seconds())
+            return fmt.Sprintf("(integer) %d", ttl)
+        }
+        
+        // Key has expired, clean up
+        s.kvstore.Lock() // Acquire a write lock for cleanup
+        defer s.kvstore.Unlock()
+        
+        delete(s.kvstore.Expirations, key)
+        delete(s.kvstore.Strings, key)
+        delete(s.kvstore.Lists, key)
+        delete(s.kvstore.Hashes, key)
+        delete(s.kvstore.Sets, key)
+        delete(s.kvstore.SortedSets, key)
+        
+        return "(integer) -2" // Indicate the key existed but has expired
+    }
+    return "(integer) -1" // Key does not exist
+}
+
+func (s *Server) handleInfo(args []string) string {
+    info := "Server Info:\n"
+    info += fmt.Sprintf("Keys in store: %d\n", len(s.kvstore.Strings))
+    info += fmt.Sprintf("Lists: %d\n", len(s.kvstore.Lists))
+    info += fmt.Sprintf("Hashes: %d\n", len(s.kvstore.Hashes))
+    info += fmt.Sprintf("Sets: %d\n", len(s.kvstore.Sets))
+    info += fmt.Sprintf("Sorted Sets: %d\n", len(s.kvstore.SortedSets))
+    return info
+}
+
+func (s *Server) handleFlushAll(args []string) string {
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+    s.kvstore.Strings = make(map[string]string)
+    s.kvstore.Lists = make(map[string][]string)
+    s.kvstore.Hashes = make(map[string]map[string]string)
+    s.kvstore.Sets = make(map[string]map[string]struct{})
+    s.kvstore.SortedSets = make(map[string]map[string]float64)
+    return "OK"
+}
+
+func (s *Server) handlePing(args []string) string {
+    return "PONG"
 }
 
 // TODO: Add more commands
