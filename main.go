@@ -33,6 +33,7 @@ func NewKeyValueStore() *KeyValueStore {
 	}
 }
 
+var pubsub = NewPubSub()
 type CommandFunc func([]string) string
 
 type Server struct {
@@ -90,6 +91,19 @@ func (s *Server) registerCommands() {
         "FLUSHALL": s.handleFlushAll,
         "PING": s.handlePing,
         //TODO: More commands will be added here
+    }
+}
+
+func (s *Server) handleCommandWithConn(cmd string, args []string, conn net.Conn) string {
+    switch cmd {
+    case "SUBSCRIBE":
+        return s.handleSubscribe(args, conn)
+    case "PUBLISH":
+        return s.handlePublish(args)
+    case "UNSUBSCRIBE":
+        return s.handleUnsubscribe(args, conn)
+    default:
+        return "ERR unknown command '" + cmd + "'"
     }
 }
 
@@ -728,6 +742,42 @@ func (s *Server) handlePing(args []string) string {
     return "PONG"
 }
 
+func (s *Server) handleSubscribe(args []string, conn net.Conn) string {
+    if len(args) != 1 {
+		return "ERROR 'SUBSCRIBE' command requires 1 argument"
+	}
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+	channel := args[0]
+	pubsub.Subscribe(channel, conn) // Subscribe the connection to the channel
+	// return "OK"
+    return fmt.Sprintf(`1) "subscribe" \n 2) "%s" \n 3) (integer) 1`, channel)
+}
+
+func (s *Server) handlePublish(args []string) string {
+    if len(args) < 2 {
+		return "ERROR 'PUBLISH' command requires at least 2 arguments"
+	}
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+	channel := args[0]
+	message := strings.Join(args[1:], " ")
+	pubsub.Publish(channel, message) // Publish the message to the channel
+	return "(integer) 1"
+}   
+
+func (s *Server) handleUnsubscribe(args []string, conn net.Conn) string {
+    if len(args) != 1 {
+		return "ERROR 'UNSUBSCRIBE' command requires 1 argument"
+	}
+    s.kvstore.Lock()
+    defer s.kvstore.Unlock()
+	channel := args[0]
+	pubsub.Unsubscribe(channel, conn) // Unsubscribe the connection from the channel
+	// return "OK"
+    return fmt.Sprintf(`1) "unsubscribe" \n 2) "%s" \n 3) (integer) 0`, channel)
+}
+
 // TODO: Add more commands
 func readCommand(resp *redisprotocol.Resp) ([]string, error) {
     value, err := resp.Read()
@@ -750,7 +800,7 @@ func readCommand(resp *redisprotocol.Resp) ([]string, error) {
     return command, nil
 }
 
-func (s *Server) processCommand(command []string) string {
+func (s *Server) processCommand(command []string, conn net.Conn) string {
     fmt.Println("Received command:", command) // yo
     if len(command) == 0 {
         return "ERR empty command"
@@ -758,6 +808,10 @@ func (s *Server) processCommand(command []string) string {
 
     cmd := strings.ToUpper(command[0])
     args := command[1:]
+
+    if cmd == "SUBSCRIBE" || cmd == "PUBLISH" || cmd == "UNSUBSCRIBE" {
+        return s.handleCommandWithConn(cmd, args, conn)
+    }
 
     if handler, ok := s.commands[cmd]; ok {
 		return handler(args)
@@ -781,7 +835,7 @@ func handleConnection(conn net.Conn, server *Server) {
             return
         }
 
-        response := server.processCommand(command)
+        response := server.processCommand(command, conn)
         err = resp.Write(redisprotocol.Value{Type: "bulk", Bulk: response})
         if err != nil {
             fmt.Println("Error writing response:", err)
