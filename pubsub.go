@@ -33,13 +33,8 @@ func (ps *PubSub) Subscribe(channel string, conn net.Conn) {
 func (ps *PubSub) Unsubscribe(channel string, conn net.Conn) {
 	ps.Lock()
 	defer ps.Unlock()
-	subscribers := ps.Subscribers[channel]
-	for i, sub := range subscribers {
-		if sub.Conn == conn {
-			ps.Subscribers[channel] = append(subscribers[:i], subscribers[i+1:]...)
-			break
-		}
-	}
+	subscriber := Subscriber{Channel: channel, Conn: conn}
+	ps.removeSubscriber(channel, subscriber)
 }
 
 func (ps *PubSub) Publish(channel, message string) {
