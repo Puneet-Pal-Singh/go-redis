@@ -34,6 +34,7 @@ func NewKeyValueStore() *KeyValueStore {
 }
 
 var pubsub = NewPubSub()
+var persistence = NewPersistence("data.rdb")
 type CommandFunc func([]string) string
 
 type Server struct {
@@ -90,6 +91,9 @@ func (s *Server) registerCommands() {
         "INFO": s.handleInfo,
         "FLUSHALL": s.handleFlushAll,
         "PING": s.handlePing,
+        // Persistence commands
+        "SAVE": s.handleSave,
+        "BGSAVE": s.handleBgsave,
         //TODO: More commands will be added here
     }
 }
@@ -778,6 +782,23 @@ func (s *Server) handleUnsubscribe(args []string, conn net.Conn) string {
     return fmt.Sprintf(`1) "unsubscribe" \n 2) "%s" \n 3) (integer) 0`, channel)
 }
 
+func (s *Server) handleSave(args []string) string {
+	s.kvstore.Lock()
+	defer s.kvstore.Unlock()
+	err := persistence.Save(s.kvstore)
+	if err != nil {
+		return "ERR " + err.Error()
+	}
+	return "OK"
+}
+
+func (s *Server) handleBgsave(args []string) string {
+	s.kvstore.Lock()
+	defer s.kvstore.Unlock()
+	persistence.Bgsave(s.kvstore)
+	return "OK"
+}
+
 // TODO: Add more commands
 func readCommand(resp *redisprotocol.Resp) ([]string, error) {
     value, err := resp.Read()
@@ -844,9 +865,18 @@ func handleConnection(conn net.Conn, server *Server) {
     }
 }
 
+func initializePersistence(server *Server) {
+	if err := persistence.Load(server.kvstore); err != nil {
+		fmt.Println("Warning:", err)
+	}
+}
+
 func main() {
 	port := "8000"
 	server := NewServer()
+
+    // Load existing data on startup
+	initializePersistence(server)
 
 	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
