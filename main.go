@@ -872,7 +872,7 @@ func initializePersistence(server *Server) {
 }
 
 func main() {
-	port := "8000"
+	port := "6378"
 	server := NewServer()
 
     // Load existing data on startup
