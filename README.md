@@ -7,9 +7,10 @@
 <p align="center">
   <a href="#dart-about">About</a> &#xa0; | &#xa0; 
   <a href="#sparkles-features">Features</a> &#xa0; | &#xa0;
-  <a href="#rocket-technologies">Technologies</a> &#xa0; | &#xa0;
+  <a href="#rocket-references">References</a> &#xa0; | &#xa0;
   <a href="#white_check_mark-requirements">Requirements</a> &#xa0; | &#xa0;
-  <a href="#checkered_flag-starting">Starting</a> &#xa0; | &#xa0;
+  <a href="#checkered_flag-installation">Installation</a> &#xa0; | &#xa0;
+  <a href="#fire-contribution">Contribution</a>  &#xa0; | &#xa0;
   <a href="#memo-license">License</a> &#xa0; | &#xa0;
   <a href="https://github.com/Puneet-Pal-Singh" target="_blank">Author</a>
 </p>
@@ -19,7 +20,6 @@
 ## :dart: About ##
 
 This project is a Redis-like server implemented in Go. It supports a variety of Redis commands across different data types, including Strings, Lists, Hashes, Sets, and Sorted Sets. Additionally, it provides basic server, connection, and persistence commands.
-
 
 ## :sparkles: Features ##
 
@@ -37,9 +37,7 @@ This project is a Redis-like server implemented in Go. It supports a variety of 
 
 :heavy_check_mark: publish/subscribe functionality for real-time messaging.
 
-
 ## :rocket: References ##
-
 
 - [Redis Documentation - Data Types](https://redis.io/docs/latest/develop/data-types/)
 - [Redis Best Practices](https://www.dragonflydb.io/guides/redis-best-practices)
@@ -122,7 +120,8 @@ Once the server is running, you can connect to it using a Redis client or throug
   ```bash
   DEL key
   ```
-### Contributing
+
+## :fire: Contribution ##
 
 Contributions are welcome! Please open an issue or submit a pull request for any improvements or features.
 
