@@ -44,7 +44,7 @@ This project is a Redis-like server implemented in Go. It supports a variety of 
 - [Build Redis from Scratch](https://www.build-redis-from-scratch.dev/en/introduction)
 - [Redis Persistence Deep Dive](https://www.memurai.com/blog/redis-persistence-deep-dive)
 - [Redis Persistence Guide](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
-- [Redis Import Guide](https://redis.io/learn/guides/import)
+- [Redis Pub/Sub](https://redis.io/docs/latest/develop/interact/pubsub/)
 
 
 ## :white_check_mark: Requirements ##
