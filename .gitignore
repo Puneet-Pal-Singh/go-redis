@@ -1,1 +1,11 @@
+# Binaries
 go-redis
+bin/
+
+# Go build outputs
+*.out
+*.so
+*.a
+
+# Dependencies
+vendor/

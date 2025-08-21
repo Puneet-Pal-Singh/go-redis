@@ -37,22 +37,45 @@ func (ps *PubSub) Unsubscribe(channel string, conn net.Conn) {
 	ps.removeSubscriber(channel, subscriber)
 }
 
-func (ps *PubSub) Publish(channel, message string) {
+func (ps *PubSub) Publish(channel, message string) int {
 	ps.RLock()
-	defer ps.RUnlock()
 
-	for _, sub := range ps.Subscribers[channel] {
-        formattedMessage := fmt.Sprintf(`1) "message" \n 2) "%s" \n 3) "%s"`, channel, message)
-        _, err := sub.Conn.Write([]byte(formattedMessage))
-        if err != nil {
-            log.Printf("Failed to send message to subscriber on channel %s: %v\n", channel, err)
-            sub.Conn.Close()
-            ps.removeSubscriber(channel, sub)
-        }
-    }
+	subscribers, ok := ps.Subscribers[channel]
+	if !ok {
+		ps.RUnlock()
+		return 0
+	}
+
+	// RESP array: ["message", channel, message]
+	payload := fmt.Sprintf("*3\r\n$7\r\nmessage\r\n$%d\r\n%s\r\n$%d\r\n%s\r\n", len(channel), channel, len(message), message)
+
+	var failedSubs []Subscriber
+	sentCount := 0
+	for _, sub := range subscribers {
+		_, err := sub.Conn.Write([]byte(payload))
+		if err != nil {
+			log.Printf("Failed to send message to subscriber on channel %s: %v\n", channel, err)
+			failedSubs = append(failedSubs, sub)
+			sub.Conn.Close()
+		} else {
+			sentCount++
+		}
+	}
+	ps.RUnlock() // Release read lock before acquiring write lock for removals
+
+	if len(failedSubs) > 0 {
+		ps.Lock()
+		for _, sub := range failedSubs {
+			ps.removeSubscriber(sub.Channel, sub)
+		}
+		ps.Unlock()
+	}
+
+	return sentCount
 }
 
 // removeSubscriber removes a subscriber from a channel.
+// It assumes the caller holds a write lock.
 func (ps *PubSub) removeSubscriber(channel string, sub Subscriber) {
     if subscribers, ok := ps.Subscribers[channel]; ok {
         for i, subscriber := range subscribers {

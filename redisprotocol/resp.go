@@ -120,6 +120,7 @@ func (r *Resp) readBulk() (Value, error) {
 
 // Writer methods
 func (r *Resp) Write(v Value) error {
+
 	switch v.Type {
 	case "array":
 		return r.writeArray(v.Array)
@@ -127,16 +128,22 @@ func (r *Resp) Write(v Value) error {
 		return r.writeBulk(v.Bulk)
 	case "string":
 		return r.writeString(v.Str)
+	case "nil":
+		return r.writeNullBulk()
 	case "error":
 		return r.writeError(v.Str)
 	case "integer":
 		return r.writeInteger(v.Num)
 	default:
-		return fmt.Errorf("unknown type: %v", v.Type)
+		return fmt.Errorf("unknown value type: %v", v.Type)
 	}
 }
 
 func (r *Resp) writeArray(arr []Value) error {
+	if arr == nil {
+		_, err := r.writer.Write([]byte("*-1\r\n"))
+		return err
+	}
 	_, err := fmt.Fprintf(r.writer, "*%d\r\n", len(arr))
 	if err != nil {
 		return err
@@ -152,6 +159,11 @@ func (r *Resp) writeArray(arr []Value) error {
 
 func (r *Resp) writeBulk(s string) error {
 	_, err := fmt.Fprintf(r.writer, "$%d\r\n%s\r\n", len(s), s)
+	return err
+}
+
+func (r *Resp) writeNullBulk() error {
+	_, err := r.writer.Write([]byte("$-1\r\n"))
 	return err
 }
 

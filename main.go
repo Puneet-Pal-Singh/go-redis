@@ -35,7 +35,7 @@ func NewKeyValueStore() *KeyValueStore {
 
 var pubsub = NewPubSub()
 var persistence = NewPersistence("data.rdb")
-type CommandFunc func([]string) string
+type CommandFunc func([]string) redisprotocol.Value
 
 type Server struct {
 	kvstore    *KeyValueStore
@@ -55,7 +55,7 @@ func (s *Server) registerCommands() {
     s.commands = map[string]CommandFunc{
         "GET":    s.handleGet,
         "SET":    s.handleSet,
-		"DEL":    s.handleDel,
+        "DEL":    s.handleDel,
         "EXISTS": s.handleExists,
         "INCR":   s.handleIncr,
         "DECR":   s.handleDecr,
@@ -98,7 +98,16 @@ func (s *Server) registerCommands() {
     }
 }
 
-func (s *Server) handleCommandWithConn(cmd string, args []string, conn net.Conn) string {
+func (s *Server) keyExistsUnlocked(key string) bool {
+	_, sExists := s.kvstore.Strings[key]
+	_, lExists := s.kvstore.Lists[key]
+	_, hExists := s.kvstore.Hashes[key]
+	_, setExists := s.kvstore.Sets[key]
+	_, zExists := s.kvstore.SortedSets[key]
+	return sExists || lExists || hExists || setExists || zExists
+}
+
+func (s *Server) handleCommandWithConn(cmd string, args []string, conn net.Conn) redisprotocol.Value {
     switch cmd {
     case "SUBSCRIBE":
         return s.handleSubscribe(args, conn)
@@ -107,158 +116,164 @@ func (s *Server) handleCommandWithConn(cmd string, args []string, conn net.Conn)
     case "UNSUBSCRIBE":
         return s.handleUnsubscribe(args, conn)
     default:
-        return "ERR unknown command '" + cmd + "'"
+        return redisprotocol.Value{Type: "error", Str: "ERR unknown command '" + cmd + "'"}
     }
 }
 
-func (s *Server) handleGet(args []string) string {
+func (s *Server) handleGet(args []string) redisprotocol.Value {
     if len(args) != 1 {
-		return "ERROR 'GET' command requires 1 argument"
+		return redisprotocol.Value{Type: "error", Str: "ERR 'GET' command requires 1 argument"}
 	}
 	key := args[0]
 	s.kvstore.RLock()
 	defer s.kvstore.RUnlock()
 
 	if value, ok := s.kvstore.Strings[key]; ok {
-		return value
+		return redisprotocol.Value{Type: "bulk", Bulk: value}
 	}
-	return "(nil)"
+	return redisprotocol.Value{Type: "nil"}
 }
 
-func (s *Server) handleSet(args []string) string {
+func (s *Server) handleSet(args []string) redisprotocol.Value {
     if len(args) != 2 {
-        return "ERROR 'GET' command requires 2 arguments"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'SET' command requires 2 arguments"}
     }
     key, value := args[0], args[1]
     s.kvstore.Lock()
 	defer s.kvstore.Unlock()
 
 	s.kvstore.Strings[key] = value
-	return "OK"
+	return redisprotocol.Value{Type: "string", Str: "OK"}
 }
 
-func (s *Server) handleDel(args []string) string {
+func (s *Server) handleDel(args []string) redisprotocol.Value {
     if len(args) < 1 {
-        return "ERROR 'DEL' command requires at least 1 argument"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'DEL' command requires at least 1 argument"}
     }
     s.kvstore.Lock()
     defer s.kvstore.Unlock()
     deletedCount := 0
     for _, key := range args {
-        if _, exists := s.kvstore.Strings[key]; exists {
-            delete(s.kvstore.Strings, key)
-            deletedCount++
-        }
+		// First, check if the key exists in any data structure to correctly
+		// increment the count of deleted keys.
+		if s.keyExistsUnlocked(key) {
+			deletedCount++
+		}
+
+		// Then, delete the key from all possible data stores.
+		// This is safe because `delete` is a no-op if the key doesn't exist.
+		delete(s.kvstore.Strings, key)
+		delete(s.kvstore.Lists, key)
+		delete(s.kvstore.Hashes, key)
+		delete(s.kvstore.Sets, key)
+		delete(s.kvstore.SortedSets, key)
+		delete(s.kvstore.Expirations, key)
     }
-    return fmt.Sprintf("(integer) %d", deletedCount)
+    return redisprotocol.Value{Type: "integer", Num: deletedCount}
 }
 
-func (s *Server) handleExists(args []string) string {
+func (s *Server) handleExists(args []string) redisprotocol.Value {
     if len(args) != 1 {
-        return "ERROR 'EXISTS' command requires 1 argument"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'EXISTS' command requires 1 argument"}
     }
     s.kvstore.RLock()
     defer s.kvstore.RUnlock()
-    if _, exists := s.kvstore.Strings[args[0]]; exists {
-        return ":1"
+    if s.keyExistsUnlocked(args[0]) {
+        return redisprotocol.Value{Type: "integer", Num: 1}
     }
-    return ":0"
+    return redisprotocol.Value{Type: "integer", Num: 0}
 }
 
-func (s *Server) handleIncr(args []string) string {
-    return s.handleIncrDecr(args, 1)
-}
-
-func (s *Server) handleDecr(args []string) string {
-    return s.handleIncrDecr(args, -1)
-}
-
-func (s *Server) handleIncrDecr(args []string, delta int64) string {
-    if len(args) != 1 {
-        return fmt.Sprintf("ERROR '%s' command requires 1 argument", strings.ToUpper(args[0]))
-    }
-    key := args[0]
+// applyDelta is a helper function that handles the core logic for all
+// increment/decrement operations. It locks the store, gets the value, applies
+// the delta, and saves the new value.
+func (s *Server) applyDelta(key string, delta int64) redisprotocol.Value {
     s.kvstore.Lock()
     defer s.kvstore.Unlock()
+
     value, exists := s.kvstore.Strings[key]
     if !exists {
-        s.kvstore.Strings[key] = "0"
         value = "0"
     }
+
     intValue, err := strconv.ParseInt(value, 10, 64)
     if err != nil {
-        return "ERROR value is not an integer or out of range"
+        return redisprotocol.Value{Type: "error", Str: "ERR value is not an integer or out of range"}
     }
-    intValue += delta
+
+	intValue += delta
     s.kvstore.Strings[key] = strconv.FormatInt(intValue, 10)
-    return fmt.Sprintf("(integer) %d", intValue)
+    return redisprotocol.Value{Type: "integer", Num: int(intValue)}
 }
 
-func (s *Server) handleIncrBy(args []string) string {
-    return s.handleIncrDecrBy(args)
+func (s *Server) handleIncr(args []string) redisprotocol.Value {
+	if len(args) != 1 {
+		return redisprotocol.Value{Type: "error", Str: "ERR wrong number of arguments for 'incr' command"}
+	}
+	return s.applyDelta(args[0], 1)
 }
 
-func (s *Server) handleDecrBy(args []string) string {
-    return s.handleIncrDecrBy(args)
+func (s *Server) handleDecr(args []string) redisprotocol.Value {
+	if len(args) != 1 {
+		return redisprotocol.Value{Type: "error", Str: "ERR wrong number of arguments for 'decr' command"}
+	}
+	return s.applyDelta(args[0], -1)
 }
 
-func (s *Server) handleIncrDecrBy(args []string) string {
-    if len(args) != 2 {
-        return fmt.Sprintf("ERROR '%s' command requires 2 arguments", strings.ToUpper(args[0]))
-    }
-    key := args[0]
-    delta, err := strconv.ParseInt(args[1], 10, 64)
-    if err != nil {
-        return "ERROR increment/decrement value is not an integer"
-    }
-    s.kvstore.Lock()
-    defer s.kvstore.Unlock()
-    value, exists := s.kvstore.Strings[key]
-    if !exists {
-        s.kvstore.Strings[key] = "0"
-        value = "0"
-    }
-    intValue, err := strconv.ParseInt(value, 10, 64)
-    if err != nil {
-        return "ERROR value is not an integer or out of range"
-    }
-    intValue += delta
-    s.kvstore.Strings[key] = strconv.FormatInt(intValue, 10)
-    return fmt.Sprintf("(integer) %d", intValue)
+func (s *Server) handleIncrBy(args []string) redisprotocol.Value {
+	if len(args) != 2 {
+		return redisprotocol.Value{Type: "error", Str: "ERR wrong number of arguments for 'incrby' command"}
+	}
+	increment, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		return redisprotocol.Value{Type: "error", Str: "ERR value is not an integer or out of range"}
+	}
+	return s.applyDelta(args[0], increment)
 }
 
-func (s *Server) handleMSet(args []string) string {
+func (s *Server) handleDecrBy(args []string) redisprotocol.Value {
+	if len(args) != 2 {
+		return redisprotocol.Value{Type: "error", Str: "ERR wrong number of arguments for 'decrby' command"}
+	}
+	decrement, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil {
+		return redisprotocol.Value{Type: "error", Str: "ERR value is not an integer or out of range"}
+	}
+	return s.applyDelta(args[0], -decrement)
+}
+
+func (s *Server) handleMSet(args []string) redisprotocol.Value {
     if len(args)%2 != 0 {
-        return "ERROR 'MSET' command requires an even number of arguments"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'MSET' command requires an even number of arguments"}
     }
     s.kvstore.Lock()
     defer s.kvstore.Unlock()
     for i := 0; i < len(args); i += 2 {
         s.kvstore.Strings[args[i]] = args[i+1]
     }
-    return "OK"
+    return redisprotocol.Value{Type: "string", Str: "OK"}
 }
 
-func (s *Server) handleMGet(args []string) string {
+func (s *Server) handleMGet(args []string) redisprotocol.Value {
     if len(args) < 1 {
-        return "ERROR 'MGET' command requires at least 1 argument"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'MGET' command requires at least 1 argument"}
     }
     s.kvstore.RLock()
     defer s.kvstore.RUnlock()
-    results := make([]string, len(args))
+    results := make([]redisprotocol.Value, len(args))
     for i, key := range args {
         if value, exists := s.kvstore.Strings[key]; exists {
-            results[i] = value
+            results[i] = redisprotocol.Value{Type: "bulk", Bulk: value}
         } else {
-            results[i] = "(nil)"
+            results[i] = redisprotocol.Value{Type: "nil"}
         }
     }
-    return strings.Join(results, "\n")
+    return redisprotocol.Value{Type: "array", Array: results}
 }
 
-func (s *Server) handleLPush(args []string) string {
+func (s *Server) handleLPush(args []string) redisprotocol.Value {
     if len(args) < 2 {
-        return "ERROR 'LPUSH' command requires at least 2 arguments"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'LPUSH' command requires at least 2 arguments"}
     }
     key := args[0]
     s.kvstore.Lock()
@@ -272,12 +287,12 @@ func (s *Server) handleLPush(args []string) string {
     for _, value := range args[1:] {
         s.kvstore.Lists[key] = append([]string{value}, s.kvstore.Lists[key]...)
     }
-    return fmt.Sprintf("(integer) %d", len(s.kvstore.Lists[key]))
+    return redisprotocol.Value{Type: "integer", Num: len(s.kvstore.Lists[key])}
 }
 
-func (s *Server) handleLPop(args []string) string {
+func (s *Server) handleLPop(args []string) redisprotocol.Value {
     if len(args) != 1 {
-        return "ERROR 'LPOP' command requires 1 argument"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'LPOP' command requires 1 argument"}
     }
     key := args[0]
     s.kvstore.Lock()
@@ -287,28 +302,28 @@ func (s *Server) handleLPop(args []string) string {
         poppedValue := list[0]
         // Remove the first element
         s.kvstore.Lists[key] = s.kvstore.Lists[key][1:]
-        return poppedValue
+        return redisprotocol.Value{Type: "bulk", Bulk: poppedValue}
     }
-    return "(nil)"
+    return redisprotocol.Value{Type: "nil"}
 }
 
-func (s *Server) handleLLen(args []string) string {
+func (s *Server) handleLLen(args []string) redisprotocol.Value {
     if len(args) != 1 {
-        return "ERROR 'LLEN' command requires 1 argument"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'LLEN' command requires 1 argument"}
     }
     key := args[0]
     s.kvstore.RLock()
     defer s.kvstore.RUnlock()
 
     if list, exists := s.kvstore.Lists[key]; exists {
-        return fmt.Sprintf("(integer) %d", len(list))
+        return redisprotocol.Value{Type: "integer", Num: len(list)}
     }
-    return "(integer) 0"
+    return redisprotocol.Value{Type: "integer", Num: 0}
 }
 
-func (s *Server) handleRPush(args []string) string {
+func (s *Server) handleRPush(args []string) redisprotocol.Value {
     if len(args) < 2 {
-        return "ERROR 'RPUSH' command requires at least 2 arguments"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'RPUSH' command requires at least 2 arguments"}
     }
     key := args[0]
     s.kvstore.Lock()
@@ -322,12 +337,12 @@ func (s *Server) handleRPush(args []string) string {
     // Append the new values to the list
     s.kvstore.Lists[key] = append(s.kvstore.Lists[key], values...)
     
-    return fmt.Sprintf("(integer) %d", len(s.kvstore.Lists[key]))
+    return redisprotocol.Value{Type: "integer", Num: len(s.kvstore.Lists[key])}
 }
 
-func (s *Server) handleRPop(args []string) string {
+func (s *Server) handleRPop(args []string) redisprotocol.Value {
     if len(args) != 1 {
-        return "ERROR 'RPOP' command requires 1 argument"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'RPOP' command requires 1 argument"}
     }
     key := args[0]
     s.kvstore.Lock()
@@ -337,14 +352,14 @@ func (s *Server) handleRPop(args []string) string {
         poppedValue := value[len(value)-1] // Get the last element
         // Remove the last element
         s.kvstore.Lists[key] = value[:len(value)-1]
-        return poppedValue
+        return redisprotocol.Value{Type: "bulk", Bulk: poppedValue}
     }
-    return "(nil)"
+    return redisprotocol.Value{Type: "nil"}
 }
 
-func (s *Server) handleHSet(args []string) string {
+func (s *Server) handleHSet(args []string) redisprotocol.Value {
     if len(args) < 3 || len(args)%2 != 1 {
-        return "ERROR 'HSET' command requires at least 3 arguments with key-value pairs"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'HSET' command requires at least 3 arguments with key-value pairs"}
     }
     key := args[0]
     s.kvstore.Lock()
@@ -355,16 +370,22 @@ func (s *Server) handleHSet(args []string) string {
         s.kvstore.Hashes[key] = make(map[string]string)
     }
 
-    for i := 1; i < len(args)-1; i += 2 {
-        s.kvstore.Hashes[key][args[i]] = args[i+1]
+    addedCount := 0
+    for i := 1; i < len(args); i += 2 {
+		field := args[i]
+		value := args[i+1]
+		if _, exists := s.kvstore.Hashes[key][field]; !exists {
+			addedCount++
+		}
+        s.kvstore.Hashes[key][field] = value
     }
 
-    return fmt.Sprintf("(integer) %d", len(s.kvstore.Hashes[key]))
+    return redisprotocol.Value{Type: "integer", Num: addedCount}
 }
 
-func (s *Server) handleHGet(args []string) string {
+func (s *Server) handleHGet(args []string) redisprotocol.Value {
     if len(args) != 2 {
-        return "ERROR 'HGET' command requires 2 arguments"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'HGET' command requires 2 arguments"}
     }
     key := args[0]
     field := args[1]
@@ -372,14 +393,14 @@ func (s *Server) handleHGet(args []string) string {
     defer s.kvstore.RUnlock()
 
     if value, exists := s.kvstore.Hashes[key][field]; exists {
-        return value
+        return redisprotocol.Value{Type: "bulk", Bulk: value}
     }
-    return "(nil)"
+    return redisprotocol.Value{Type: "nil"}
 }
 
-func (s *Server) handleHDel(args []string) string {
+func (s *Server) handleHDel(args []string) redisprotocol.Value {
     if len(args) < 2 {
-        return "ERROR 'HDEL' command requires at least 2 arguments"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'HDEL' command requires at least 2 arguments"}
     }
     key := args[0]
     fields := args[1:]
@@ -387,7 +408,7 @@ func (s *Server) handleHDel(args []string) string {
     defer s.kvstore.Unlock()
 
     if _, exists := s.kvstore.Hashes[key]; !exists {
-        return "(integer) 0"
+        return redisprotocol.Value{Type: "integer", Num: 0}
     }
 
     count := 0
@@ -398,96 +419,74 @@ func (s *Server) handleHDel(args []string) string {
         }
     }
 
-    return fmt.Sprintf("(integer) %d", count)
+    return redisprotocol.Value{Type: "integer", Num: count}
 }
 
-func (s *Server) handleHLen(args []string) string {
+func (s *Server) handleHLen(args []string) redisprotocol.Value {
     if len(args) != 1 {
-        return "ERROR 'HLEN' command requires 1 argument"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'HLEN' command requires 1 argument"}
     }
     key := args[0]
     s.kvstore.RLock()
     defer s.kvstore.RUnlock()
 
     if fields, exists := s.kvstore.Hashes[key]; exists {
-        return fmt.Sprintf("(integer) %d", len(fields))
+        return redisprotocol.Value{Type: "integer", Num: len(fields)}
     }
-    return "(integer) 0"
+    return redisprotocol.Value{Type: "integer", Num: 0}
 }
 
-// func (s *Server) handleHMGet(args []string) string {
-//     if len(args) < 2 {
-//         return "ERROR 'HMGET' command requires at least 2 arguments"
-//     }
-//     key := args[0]
-//     fields := args[1:]
-//     s.kvstore.RLock()
-//     defer s.kvstore.RUnlock()
-
-//     if values, exists := s.kvstore.Hashes[key]; exists {
-//         var result []string
-//         for _, field := range fields {
-//             if value, fieldExists := values[field]; fieldExists {
-//                 result = append(result, value)
-//             } else {
-//                 result = append(result, "(nil)")
-//             }
-//         }
-//         return strings.Join(result, "\n")
-//     }
-//     return "(nil)"
-// }
-
-func (s *Server) handleHMGet(args []string) string {
+func (s *Server) handleHMGet(args []string) redisprotocol.Value {
     if len(args) < 2 {
-        return "ERROR 'HMGET' command requires at least 2 arguments"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'HMGET' command requires at least 2 arguments"}
     }
     key := args[0]
     fields := args[1:]
     s.kvstore.RLock()
     defer s.kvstore.RUnlock()
 
-    if values, exists := s.kvstore.Hashes[key]; exists {
-        var result []string
-        for i, field := range fields {
-            var value string
-            if val, fieldExists := values[field]; fieldExists {
-                value = fmt.Sprintf(`"%s"`, val)
-            } else {
-                value = "(nil)"
-            }
-            result = append(result, fmt.Sprintf("%d) %s", i+1, value))
-        }
-        return strings.Join(result, "\n")
+    results := make([]redisprotocol.Value, len(fields))
+    hash, exists := s.kvstore.Hashes[key]
+    if !exists {
+		for i := range fields {
+			results[i] = redisprotocol.Value{Type: "nil"}
+		}
+		return redisprotocol.Value{Type: "array", Array: results}
     }
-    return "(nil)"
+
+	for i, field := range fields {
+		if value, ok := hash[field]; ok {
+			results[i] = redisprotocol.Value{Type: "bulk", Bulk: value}
+		} else {
+			results[i] = redisprotocol.Value{Type: "nil"}
+		}
+	}
+
+    return redisprotocol.Value{Type: "array", Array: results}
 }
 
-func (s *Server) handleHGetAll(args []string) string {
+func (s *Server) handleHGetAll(args []string) redisprotocol.Value {
     if len(args) != 1 {
-        return "ERROR 'HGETALL' command requires 1 argument"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'HGETALL' command requires 1 argument"}
     }
     key := args[0]
     s.kvstore.RLock()
     defer s.kvstore.RUnlock()
 
     if fields, exists := s.kvstore.Hashes[key]; exists {
-        var result []string
-        index := 1
+		result := make([]redisprotocol.Value, 0, len(fields)*2)
         for field, value := range fields {
-            result = append(result, fmt.Sprintf("%d) \"%s\"", index, field))
-            index++
-            result = append(result, fmt.Sprintf("%d) \"%s\"", index, value))
-            index++
+			result = append(result, redisprotocol.Value{Type: "bulk", Bulk: field})
+			result = append(result, redisprotocol.Value{Type: "bulk", Bulk: value})
         }
-        return strings.Join(result, "\n")
+        return redisprotocol.Value{Type: "array", Array: result}
     }
-    return "(empty)"
+    return redisprotocol.Value{Type: "array", Array: []redisprotocol.Value{}}
 }
 
-func (s *Server) handleSAdd(args []string) string {
+func (s *Server) handleSAdd(args []string) redisprotocol.Value {
     if len(args) < 2 {
-        return "ERROR 'SADD' command requires at least 2 arguments"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'SADD' command requires at least 2 arguments"}
     }
     key := args[0]
     s.kvstore.Lock()
@@ -504,19 +503,19 @@ func (s *Server) handleSAdd(args []string) string {
             addedCount++
         }
     }
-    return fmt.Sprintf("(integer) %d", addedCount)
+    return redisprotocol.Value{Type: "integer", Num: addedCount}
 }
 
-func (s *Server) handleSRem(args []string) string {
+func (s *Server) handleSRem(args []string) redisprotocol.Value {
     if len(args) < 2 {
-        return "ERROR 'SREM' command requires at least 2 arguments"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'SREM' command requires at least 2 arguments"}
     }
     key := args[0]
     s.kvstore.Lock()
     defer s.kvstore.Unlock()
 
     if _, exists := s.kvstore.Sets[key]; !exists {
-        return "(integer) 0"
+        return redisprotocol.Value{Type: "integer", Num: 0}
     }
 
     removedCount := 0
@@ -526,31 +525,30 @@ func (s *Server) handleSRem(args []string) string {
             removedCount++
         }
     }
-    return fmt.Sprintf("(integer) %d", removedCount)
+    return redisprotocol.Value{Type: "integer", Num: removedCount}
 }
 
-func (s *Server) handleSMembers(args []string) string {
+func (s *Server) handleSMembers(args []string) redisprotocol.Value {
     if len(args) != 1 {
-        return "ERROR 'SMEMBERS' command requires 1 argument"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'SMEMBERS' command requires 1 argument"}
     }
     key := args[0]
     s.kvstore.RLock()
     defer s.kvstore.RUnlock()
 
     if memberSet, exists := s.kvstore.Sets[key]; exists {
-        result := make([]string, 0, len(memberSet))
+		values := make([]redisprotocol.Value, 0, len(memberSet))
         for member := range memberSet {
-            result = append(result, member)
+			values = append(values, redisprotocol.Value{Type: "bulk", Bulk: member})
         }
-        sort.Strings(result)  // Sort the slice
-        return strings.Join(result, "\n")
+        return redisprotocol.Value{Type: "array", Array: values}
     }
-    return "(empty)"
+    return redisprotocol.Value{Type: "array", Array: []redisprotocol.Value{}}
 }
 
-func (s *Server) handleSIsMember(args []string) string {
+func (s *Server) handleSIsMember(args []string) redisprotocol.Value {
     if len(args) != 2 {
-        return "ERROR 'SISMEMBER' command requires 2 arguments"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'SISMEMBER' command requires 2 arguments"}
     }
     key := args[0]
     member := args[1]
@@ -559,15 +557,15 @@ func (s *Server) handleSIsMember(args []string) string {
 
     if set, exists := s.kvstore.Sets[key]; exists {
         if _, exists := set[member]; exists {
-            return "(integer) 1"
+            return redisprotocol.Value{Type: "integer", Num: 1}
         }
     }
-    return "(integer) 0"
+    return redisprotocol.Value{Type: "integer", Num: 0}
 }
 
-func (s *Server) handleZAdd(args []string) string {
+func (s *Server) handleZAdd(args []string) redisprotocol.Value {
     if len(args) < 3 || len(args)%2 != 1 {
-        return "ERROR 'ZADD' command requires at least 3 arguments with score-member pairs"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'ZADD' command requires at least 3 arguments with score-member pairs"}
     }
     key := args[0]
     s.kvstore.Lock()
@@ -581,7 +579,7 @@ func (s *Server) handleZAdd(args []string) string {
     for i := 1; i < len(args)-1; i += 2 {
         score, err := strconv.ParseFloat(args[i], 64)
         if err != nil {
-            return "ERROR score is not a valid number"
+            return redisprotocol.Value{Type: "error", Str: "ERR score is not a valid number"}
         }
         member := args[i+1]
         if _, exists := s.kvstore.SortedSets[key][member]; !exists {
@@ -589,12 +587,12 @@ func (s *Server) handleZAdd(args []string) string {
             addedCount++
         }
     }
-    return fmt.Sprintf("(integer) %d", addedCount)
+    return redisprotocol.Value{Type: "integer", Num: addedCount}
 }
 
-func (s *Server) handleZRange(args []string) string {
+func (s *Server) handleZRange(args []string) redisprotocol.Value {
     if len(args) != 3 {
-        return "ERROR 'ZRANGE' command requires 3 arguments"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'ZRANGE' command requires 3 arguments"}
     }
     key := args[0]
     start, err1 := strconv.Atoi(args[1])
@@ -603,7 +601,7 @@ func (s *Server) handleZRange(args []string) string {
     defer s.kvstore.RUnlock()
 
     if err1 != nil || err2 != nil {
-        return "ERROR start or end is not a valid integer"
+        return redisprotocol.Value{Type: "error", Str: "ERR start or end is not a valid integer"}
     }
 
     if sortedSet, exists := s.kvstore.SortedSets[key]; exists {
@@ -632,29 +630,29 @@ func (s *Server) handleZRange(args []string) string {
             end = len(members) - 1
         }
         if start > end {
-            return "(empty)"
+            return redisprotocol.Value{Type: "array", Array: []redisprotocol.Value{}}
         }
 
         // Prepare the result
-        result := make([]string, 0, end-start+1)
+        result := make([]redisprotocol.Value, 0, end-start+1)
         for i := start; i <= end; i++ {
-            result = append(result, fmt.Sprintf(`"%s"`, members[i]))
+            result = append(result, redisprotocol.Value{Type: "bulk", Bulk: members[i]})
         }
-        return strings.Join(result, "\n") // Return as separate lines
+        return redisprotocol.Value{Type: "array", Array: result}
     }
-    return "(empty)"
+    return redisprotocol.Value{Type: "array", Array: []redisprotocol.Value{}}
 }
 
-func (s *Server) handleZRem(args []string) string {
+func (s *Server) handleZRem(args []string) redisprotocol.Value {
     if len(args) < 2 {
-        return "ERROR 'ZREM' command requires at least 2 arguments"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'ZREM' command requires at least 2 arguments"}
     }
     key := args[0]
     s.kvstore.Lock()
     defer s.kvstore.Unlock()
 
     if _, exists := s.kvstore.SortedSets[key]; !exists {
-        return "(integer) 0"
+        return redisprotocol.Value{Type: "integer", Num: 0}
     }
 
     removedCount := 0
@@ -664,33 +662,33 @@ func (s *Server) handleZRem(args []string) string {
             removedCount++
         }
     }
-    return fmt.Sprintf("(integer) %d", removedCount)
+    return redisprotocol.Value{Type: "integer", Num: removedCount}
 }
 
 
-func (s *Server) handleExpire(args []string) string {
+func (s *Server) handleExpire(args []string) redisprotocol.Value {
     if len(args) != 2 {
-        return "ERROR 'EXPIRE' command requires 2 arguments"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'EXPIRE' command requires 2 arguments"}
     }
     key := args[0]
     seconds, err := strconv.ParseInt(args[1], 10, 64)
     if err != nil {
-        return "ERROR seconds must be a valid integer"
+        return redisprotocol.Value{Type: "error", Str: "ERR seconds must be a valid integer"}
     }
     
     s.kvstore.Lock()
     defer s.kvstore.Unlock()
     
-    if _, exists := s.kvstore.Strings[key]; exists {
+    if s.keyExistsUnlocked(key) {
         s.kvstore.Expirations[key] = time.Now().Add(time.Duration(seconds) * time.Second) // Set expiration time
-        return "OK"
+        return redisprotocol.Value{Type: "integer", Num: 1}
     }
-    return "(nil)"
+    return redisprotocol.Value{Type: "integer", Num: 0}
 }
 
-func (s *Server) handleTTL(args []string) string {
+func (s *Server) handleTTL(args []string) redisprotocol.Value {
     if len(args) != 1 {
-        return "ERROR 'TTL' command requires 1 argument"
+        return redisprotocol.Value{Type: "error", Str: "ERR 'TTL' command requires 1 argument"}
     }
     key := args[0]
 
@@ -702,7 +700,7 @@ func (s *Server) handleTTL(args []string) string {
         if time.Now().Before(expiration) {
             // Calculate remaining TTL
             ttl := int(time.Until(expiration).Seconds())
-            return fmt.Sprintf("(integer) %d", ttl)
+            return redisprotocol.Value{Type: "integer", Num: ttl}
         }
         
         // Key has expired, clean up
@@ -716,22 +714,22 @@ func (s *Server) handleTTL(args []string) string {
         delete(s.kvstore.Sets, key)
         delete(s.kvstore.SortedSets, key)
         
-        return "(integer) -2" // Indicate the key existed but has expired
+        return redisprotocol.Value{Type: "integer", Num: -2} // Indicate the key existed but has expired
     }
-    return "(integer) -1" // Key does not exist
+    return redisprotocol.Value{Type: "integer", Num: -1} // Key does not exist
 }
 
-func (s *Server) handleInfo(args []string) string {
+func (s *Server) handleInfo(args []string) redisprotocol.Value {
     info := "Server Info:\n"
     info += fmt.Sprintf("Keys in store: %d\n", len(s.kvstore.Strings))
     info += fmt.Sprintf("Lists: %d\n", len(s.kvstore.Lists))
     info += fmt.Sprintf("Hashes: %d\n", len(s.kvstore.Hashes))
     info += fmt.Sprintf("Sets: %d\n", len(s.kvstore.Sets))
     info += fmt.Sprintf("Sorted Sets: %d\n", len(s.kvstore.SortedSets))
-    return info
+    return redisprotocol.Value{Type: "bulk", Bulk: info}
 }
 
-func (s *Server) handleFlushAll(args []string) string {
+func (s *Server) handleFlushAll(args []string) redisprotocol.Value {
     s.kvstore.Lock()
     defer s.kvstore.Unlock()
     s.kvstore.Strings = make(map[string]string)
@@ -739,64 +737,68 @@ func (s *Server) handleFlushAll(args []string) string {
     s.kvstore.Hashes = make(map[string]map[string]string)
     s.kvstore.Sets = make(map[string]map[string]struct{})
     s.kvstore.SortedSets = make(map[string]map[string]float64)
-    return "OK"
+    return redisprotocol.Value{Type: "string", Str: "OK"}
 }
 
-func (s *Server) handlePing(args []string) string {
-    return "PONG"
+func (s *Server) handlePing(args []string) redisprotocol.Value {
+    return redisprotocol.Value{Type: "string", Str: "PONG"}
 }
 
-func (s *Server) handleSubscribe(args []string, conn net.Conn) string {
+func (s *Server) handleSubscribe(args []string, conn net.Conn) redisprotocol.Value {
     if len(args) != 1 {
-		return "ERROR 'SUBSCRIBE' command requires 1 argument"
+		return redisprotocol.Value{Type: "error", Str: "ERR 'SUBSCRIBE' command requires 1 argument"}
 	}
     s.kvstore.Lock()
     defer s.kvstore.Unlock()
 	channel := args[0]
 	pubsub.Subscribe(channel, conn) // Subscribe the connection to the channel
-	// return "OK"
-    return fmt.Sprintf(`1) "subscribe" \n 2) "%s" \n 3) (integer) 1`, channel)
+	return redisprotocol.Value{Type: "array", Array: []redisprotocol.Value{
+		{Type: "bulk", Bulk: "subscribe"},
+		{Type: "bulk", Bulk: channel},
+		{Type: "integer", Num: 1},
+	}}
 }
 
-func (s *Server) handlePublish(args []string) string {
+func (s *Server) handlePublish(args []string) redisprotocol.Value {
     if len(args) < 2 {
-		return "ERROR 'PUBLISH' command requires at least 2 arguments"
+		return redisprotocol.Value{Type: "error", Str: "ERR 'PUBLISH' command requires at least 2 arguments"}
 	}
-    s.kvstore.Lock()
-    defer s.kvstore.Unlock()
 	channel := args[0]
 	message := strings.Join(args[1:], " ")
-	pubsub.Publish(channel, message) // Publish the message to the channel
-	return "(integer) 1"
+	count := pubsub.Publish(channel, message) // Publish the message to the channel
+	return redisprotocol.Value{Type: "integer", Num: count}
 }   
 
-func (s *Server) handleUnsubscribe(args []string, conn net.Conn) string {
+func (s *Server) handleUnsubscribe(args []string, conn net.Conn) redisprotocol.Value {
     if len(args) != 1 {
-		return "ERROR 'UNSUBSCRIBE' command requires 1 argument"
+		return redisprotocol.Value{Type: "error", Str: "ERR 'UNSUBSCRIBE' command requires 1 argument"}
 	}
     s.kvstore.Lock()
     defer s.kvstore.Unlock()
 	channel := args[0]
 	pubsub.Unsubscribe(channel, conn) // Unsubscribe the connection from the channel
-	// return "OK"
-    return fmt.Sprintf(`1) "unsubscribe" \n 2) "%s" \n 3) (integer) 0`, channel)
+	return redisprotocol.Value{Type: "array", Array: []redisprotocol.Value{
+		{Type: "bulk", Bulk: "unsubscribe"},
+		{Type: "bulk", Bulk: channel},
+		{Type: "integer", Num: 0},
+	}}
 }
 
-func (s *Server) handleSave(args []string) string {
+func (s *Server) handleSave(args []string) redisprotocol.Value {
 	s.kvstore.Lock()
 	defer s.kvstore.Unlock()
 	err := persistence.Save(s.kvstore)
 	if err != nil {
-		return "ERR " + err.Error()
+		return redisprotocol.Value{Type: "error", Str: "ERR " + err.Error()}
 	}
-	return "OK"
+	return redisprotocol.Value{Type: "string", Str: "OK"}
 }
 
-func (s *Server) handleBgsave(args []string) string {
+func (s *Server) handleBgsave(args []string) redisprotocol.Value {
 	s.kvstore.Lock()
 	defer s.kvstore.Unlock()
 	persistence.Bgsave(s.kvstore)
-	return "OK"
+	return redisprotocol.Value{Type: "string", Str: "Background saving started"}
 }
 
 // TODO: Add more commands
@@ -821,10 +823,10 @@ func readCommand(resp *redisprotocol.Resp) ([]string, error) {
     return command, nil
 }
 
-func (s *Server) processCommand(command []string, conn net.Conn) string {
+func (s *Server) processCommand(command []string, conn net.Conn) redisprotocol.Value {
     fmt.Println("Received command:", command) // yo
     if len(command) == 0 {
-        return "ERR empty command"
+        return redisprotocol.Value{Type: "error", Str: "ERR empty command"}
     }
 
     cmd := strings.ToUpper(command[0])
@@ -838,7 +840,7 @@ func (s *Server) processCommand(command []string, conn net.Conn) string {
 		return handler(args)
 	}
 
-	return "ERR unknown command '" + cmd + "'"
+	return redisprotocol.Value{Type: "error", Str: "ERR unknown command '" + cmd + "'"}
 }
 
 func handleConnection(conn net.Conn, server *Server) {
@@ -857,7 +859,7 @@ func handleConnection(conn net.Conn, server *Server) {
         }
 
         response := server.processCommand(command, conn)
-        err = resp.Write(redisprotocol.Value{Type: "bulk", Bulk: response})
+        err = resp.Write(response)
         if err != nil {
             fmt.Println("Error writing response:", err)
             return

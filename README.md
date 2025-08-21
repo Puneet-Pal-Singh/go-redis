@@ -68,9 +68,8 @@ Before starting :checkered_flag:, you need to have [Git](https://git-scm.com) an
    ```
 
 3. Build the application:
-
    ```bash
-   go build -o go-redis
+   go build -o main .
    ```
 
 ### Running the Application
@@ -78,9 +77,8 @@ Before starting :checkered_flag:, you need to have [Git](https://git-scm.com) an
 You can run the application directly or use Docker.
 
 #### Directly
-
   ```bash
-   go run ./main
+   ./main
   ```
 
 #### Using `Docker`
