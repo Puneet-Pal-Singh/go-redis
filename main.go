@@ -687,36 +687,45 @@ func (s *Server) handleExpire(args []string) redisprotocol.Value {
 }
 
 func (s *Server) handleTTL(args []string) redisprotocol.Value {
-    if len(args) != 1 {
-        return redisprotocol.Value{Type: "error", Str: "ERR 'TTL' command requires 1 argument"}
-    }
-    key := args[0]
+	if len(args) != 1 {
+		return redisprotocol.Value{Type: "error", Str: "ERR 'TTL' command requires 1 argument"}
+	}
+	key := args[0]
 
-    s.kvstore.RLock()
-    expiration, exists := s.kvstore.Expirations[key]
-    s.kvstore.RUnlock()
-    
-    if exists {
-        if time.Now().Before(expiration) {
-            // Calculate remaining TTL
-            ttl := int(time.Until(expiration).Seconds())
-            return redisprotocol.Value{Type: "integer", Num: ttl}
-        }
-        
-        // Key has expired, clean up
-        s.kvstore.Lock() // Acquire a write lock for cleanup
-        defer s.kvstore.Unlock()
-        
-        delete(s.kvstore.Expirations, key)
-        delete(s.kvstore.Strings, key)
-        delete(s.kvstore.Lists, key)
-        delete(s.kvstore.Hashes, key)
-        delete(s.kvstore.Sets, key)
-        delete(s.kvstore.SortedSets, key)
-        
-        return redisprotocol.Value{Type: "integer", Num: -2} // Indicate the key existed but has expired
-    }
-    return redisprotocol.Value{Type: "integer", Num: -1} // Key does not exist
+	s.kvstore.Lock() // Use a single write lock for the entire operation
+	defer s.kvstore.Unlock()
+
+	expiration, hasExpiry := s.kvstore.Expirations[key]
+
+	// First, check if the key has an expiry and if it has actually passed
+	if hasExpiry && time.Now().After(expiration) {
+		// Key has expired, so we must delete it from all data stores
+		delete(s.kvstore.Strings, key)
+		delete(s.kvstore.Lists, key)
+		delete(s.kvstore.Hashes, key)
+		delete(s.kvstore.Sets, key)
+		delete(s.kvstore.SortedSets, key)
+		delete(s.kvstore.Expirations, key)
+		// After deletion, the key no longer exists, so we return -2
+		return redisprotocol.Value{Type: "integer", Num: -2}
+	}
+
+	// Next, check if the key exists at all. This handles cases where the key never existed
+	// or was just deleted by the block above.
+	if !s.keyExistsUnlocked(key) {
+		return redisprotocol.Value{Type: "integer", Num: -2}
+	}
+
+	// If we reach here, the key exists and has not expired.
+	// Now we check if it has an expiry set.
+	if hasExpiry {
+		// It has a future expiration date, so calculate the remaining time.
+		ttl := int(time.Until(expiration).Seconds())
+		return redisprotocol.Value{Type: "integer", Num: ttl}
+	} else {
+		// The key exists but has no expiry.
+		return redisprotocol.Value{Type: "integer", Num: -1}
+	}
 }
 
 func (s *Server) handleInfo(args []string) redisprotocol.Value {
