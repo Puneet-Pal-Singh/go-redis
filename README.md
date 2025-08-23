@@ -67,19 +67,34 @@ Before starting :checkered_flag:, you need to have [Git](https://git-scm.com) an
    go mod download
    ```
 
-3. Build the application:
-   ```bash
-   go build -o main .
-   ```
+3. Build the application: You have two options:
+
+    **Option A: Local Build (Simple)**
+    This will create an executable in the `bin/` directory.
+    ```bash
+    go build -o ./bin/redis-server ./cmd/redis-server/
+    ```
+
+    **Option B: System-Wide Install (Recommended)**
+    This is the standard Go way. It installs the binary into your Go path, making it available as a system command.
+    ```bash
+    go install ./cmd/redis-server/
+    ```
 
 ### Running the Application
 
 You can run the application directly or use Docker.
 
 #### Directly
-  ```bash
-   ./main
-  ```
+*   If you used the **local build** (Option A):
+    ```bash
+    ./bin/redis-server
+    ```
+*   If you used the **system-wide install** (Option B):
+    ```bash
+    redis-server
+    ```
+
 
 #### Using `Docker`
 
@@ -94,6 +109,33 @@ You can run the application directly or use Docker.
    ```bash
    docker run -p 6378:6378 go-redis
    ```
+
+#### Configuration Flags
+You can customize the server with the following flags:
+*   `--port`: The port to listen on (default: `6378`).
+*   `--dbpath`: The file path for database persistence (default: `data.rdb`).
+
+**Example:**
+```bash
+redis-server --port 9000 --dbpath /tmp/my-redis.rdb
+```
+
+### Running with Docker
+
+To run the server inside a Docker container, use the following command. This will map port `6378` on your machine to the container and, crucially, **persist your data** in a Docker volume.
+
+```bash
+docker run -p 6378:6378 -v go-redis-data:/data go-redis
+```
+*   `-p 6378:6378`: Maps the host port to the container port.
+*   `-v go-redis-data:/data`: Creates a Docker volume named `go-redis-data` and mounts it to the `/data` directory inside the container. This ensures your data survives even if the container is stopped or removed.
+
+### Connecting to the Server
+
+Once the server is running, you can connect to it using any Redis client:
+```bash
+redis-cli -p 6378
+```
 
 ### Usage
 
