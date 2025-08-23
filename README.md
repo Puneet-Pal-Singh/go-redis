@@ -61,13 +61,7 @@ Before starting :checkered_flag:, you need to have [Git](https://git-scm.com) an
    cd go-redis
    ```
 
-2. Install dependencies:
-
-   ```bash
-   go mod download
-   ```
-
-3. Build the application: You have two options:
+2. Build the application: You have two options:
 
     **Option A: Local Build (Simple)**
     This will create an executable in the `bin/` directory.
