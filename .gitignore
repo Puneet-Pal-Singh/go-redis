@@ -9,3 +9,16 @@ bin/
 
 # Dependencies
 vendor/
+
+# Database and backup files
+*.rdb
+*.rdb.bak
+
+# Log files
+*.log
+
+# Test reports
+test_results.md
+
+# OS-specific files
+.DS_Store
