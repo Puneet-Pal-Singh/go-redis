@@ -1,4 +1,4 @@
-package redisprotocol
+package protocol
 
 import (
 	"bufio"
