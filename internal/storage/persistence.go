@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"time"
+	"go.uber.org/zap"
 )
 
 type Persistence struct {
@@ -38,14 +38,15 @@ func (p *Persistence) Save(kvstore *KeyValueStore) error {
 }
 
 // BGSAVE command: saves the database to disk in the background
-func (p *Persistence) Bgsave(kvstore *KeyValueStore) {
+func (p *Persistence) Bgsave(kvstore *KeyValueStore, log *zap.Logger) {
 	go func() {
-		time.Sleep(2 * time.Second) // Simulate time taken to save
+		// We don't need to sleep here anymore, this was for simulation
+		// time.Sleep(2 * time.Second) // Simulate time taken to save
 		err := p.Save(kvstore)
 		if err != nil {
-			fmt.Println(err)
+			log.Error("Background save failed", zap.Error(err))
 		} else {
-			fmt.Println("Database saved in the background.")
+			log.Info("Database saved successfully in the background")
 		}
 	}()
 }

@@ -13,6 +13,8 @@ import (
 	"github.com/Puneet-Pal-Singh/go-redis/internal/protocol"
 	"github.com/Puneet-Pal-Singh/go-redis/internal/pubsub"
 	"github.com/Puneet-Pal-Singh/go-redis/internal/storage"
+
+	"go.uber.org/zap"
 )
 
 type CommandFunc func([]string) protocol.Value
@@ -22,14 +24,16 @@ type Server struct {
 	pubsub      *pubsub.PubSub
 	persistence *storage.Persistence
 	commands    map[string]CommandFunc
+	log         *zap.Logger 
 }
 
-func NewServer(persistencePath string) *Server {
+func NewServer(persistencePath string, logger *zap.Logger) *Server {
 	s := &Server{
 		kvstore:     storage.NewKeyValueStore(),
 		pubsub:      pubsub.NewPubSub(),
 		persistence: storage.NewPersistence(persistencePath),
 		commands:    make(map[string]CommandFunc),
+		log:         logger,
 	}
 	s.registerCommands()
 	s.initializePersistence()
@@ -38,7 +42,7 @@ func NewServer(persistencePath string) *Server {
 
 func (s *Server) initializePersistence() {
 	if err := s.persistence.Load(s.kvstore); err != nil {
-		fmt.Println("Warning:", err)
+		s.log.Warn("Failed to load data from persistence file", zap.Error(err))
 	}
 }
 
@@ -84,23 +88,27 @@ func (s *Server) registerCommands() {
 
 func (s *Server) HandleConnection(conn net.Conn) {
 	defer conn.Close()
+
+	// Add client address for context
+	s.log.Info("Client connected", zap.String("remote_addr", conn.RemoteAddr().String()))
+
 	resp := protocol.NewResp(conn, conn)
 
 	for {
 		command, err := s.readCommand(resp)
 		if err != nil {
 			if err == io.EOF {
-				fmt.Println("Client disconnected")
+				s.log.Info("Client disconnected", zap.String("remote_addr", conn.RemoteAddr().String()))
 				return
 			}
-			fmt.Println("Error reading command:", err)
+			s.log.Error("Error reading command", zap.Error(err))
 			return
 		}
 
 		response := s.processCommand(command, conn)
 		err = resp.Write(response)
 		if err != nil {
-			fmt.Println("Error writing response:", err)
+			s.log.Error("Error writing response", zap.Error(err))
 			return
 		}
 	}
@@ -128,7 +136,14 @@ func (s *Server) readCommand(resp *protocol.Resp) ([]string, error) {
 }
 
 func (s *Server) processCommand(command []string, conn net.Conn) protocol.Value {
-	fmt.Println("Received command:", command)
+	if len(command) > 0 {
+		s.log.Debug("Processing command",
+			zap.String("command", command[0]),
+			zap.Strings("args", command[1:]),
+			zap.String("client", conn.RemoteAddr().String()),
+		)
+	}
+
 	if len(command) == 0 {
 		return protocol.Value{Type: "error", Str: "ERR empty command"}
 	}
@@ -884,8 +899,8 @@ func (s *Server) handleSave(args []string) protocol.Value {
 }
 
 func (s *Server) handleBgsave(args []string) protocol.Value {
-	s.kvstore.Lock()
-	defer s.kvstore.Unlock()
-	s.persistence.Bgsave(s.kvstore)
+	s.kvstore.RLock()
+	defer s.kvstore.RUnlock()
+	s.persistence.Bgsave(s.kvstore, s.log)
 	return protocol.Value{Type: "string", Str: "Background saving started"}
 }
