@@ -5,16 +5,23 @@ import (
 	"flag"
 	"log" // Use the standard log for fatal errors before logger is set up
 	"net"
+	"net/http"
+
 
 	"github.com/Puneet-Pal-Singh/go-redis/internal/server"
 	"github.com/Puneet-Pal-Singh/go-redis/pkg/logger"
 	"go.uber.org/zap"                                  // The Zap library
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
 	// --- 1. Configuration Setup using Flags ---
 	// Define command-line flags for port and database path.
 	port := flag.String("port", "6378", "Port to listen on")
+
+	// New flag for metrics port
+	metricsPort := flag.String("metrics-port", "9091", "Port for the Prometheus metrics server")
 	dbPath := flag.String("dbpath", "data.rdb", "Path to the database file")
 	flag.Parse() // Parse the flags provided by the user.
 
@@ -28,7 +35,16 @@ func main() {
 	// Flushes any buffered log entries before the application exits. A good practice.
 	defer appLogger.Sync()
 
-	// --- 3. Server Startup ---
+	// --- 3. Start Metrics Server (in a goroutine) ---
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		appLogger.Info("Metrics server starting...", zap.String("port", *metricsPort))
+		if err := http.ListenAndServe(":"+*metricsPort, nil); err != nil {
+			appLogger.Fatal("Failed to start metrics server", zap.Error(err))
+		}
+	}()
+	
+	// --- 4. Server Startup ---
 	appLogger.Info("Starting Go Redis server...",
 		zap.String("port", *port),
 		zap.String("db_path", *dbPath),
@@ -46,7 +62,7 @@ func main() {
 
 	appLogger.Info("Server is listening and ready to accept connections")
 
-	// --- 4. Connection Handling Loop ---
+	// --- 5. Connection Handling Loop ---
 	// Continuously accept and handle new client connections.
 	for {
 		conn, err := listener.Accept()

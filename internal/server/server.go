@@ -13,8 +13,25 @@ import (
 	"github.com/Puneet-Pal-Singh/go-redis/internal/protocol"
 	"github.com/Puneet-Pal-Singh/go-redis/internal/pubsub"
 	"github.com/Puneet-Pal-Singh/go-redis/internal/storage"
-
+	
 	"go.uber.org/zap"
+	"github.com/prometheus/client_golang/prometheus"
+    "github.com/prometheus/client_golang/prometheus/promauto"
+)
+
+var (
+	// commandsProcessed is a Counter vector to count processed commands by type.
+	// The "promauto" package automatically handles registration.
+	commandsProcessed = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "redis_commands_processed_total",
+		Help: "The total number of processed commands, labeled by command name.",
+	}, []string{"command"})
+
+	// connectedClients is a Gauge to track the current number of connected clients.
+	connectedClients = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "redis_connected_clients",
+		Help: "Current number of connected clients.",
+	})
 )
 
 type CommandFunc func([]string) protocol.Value
@@ -87,10 +104,15 @@ func (s *Server) registerCommands() {
 }
 
 func (s *Server) HandleConnection(conn net.Conn) {
-	defer conn.Close()
+	// Increment the gauge when a client connects
+    connectedClients.Inc()
+    // Use defer to ensure the gauge is decremented when the function returns
+    defer connectedClients.Dec()
 
+	defer conn.Close()
+	clientAddr := conn.RemoteAddr().String()
 	// Add client address for context
-	s.log.Info("Client connected", zap.String("remote_addr", conn.RemoteAddr().String()))
+	s.log.Info("Client connected", zap.String("remote_addr", clientAddr))
 
 	resp := protocol.NewResp(conn, conn)
 
@@ -150,6 +172,9 @@ func (s *Server) processCommand(command []string, conn net.Conn) protocol.Value 
 
 	cmd := strings.ToUpper(command[0])
 	args := command[1:]
+
+	// Increment the counter for the specific command
+    commandsProcessed.WithLabelValues(cmd).Inc()
 
 	if cmd == "SUBSCRIBE" || cmd == "PUBLISH" || cmd == "UNSUBSCRIBE" {
 		return s.handleCommandWithConn(cmd, args, conn)

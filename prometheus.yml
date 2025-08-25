@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'go-redis-server'
+    static_configs:
+      # IMPORTANT: Use 'host.docker.internal' to allow the Docker container
+      # to connect to a service running on your host machine.
+      - targets: ['host.docker.internal:9091']
