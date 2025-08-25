@@ -154,7 +154,7 @@ hash_commands() {
     run_test "HSET second" "1" "exact" HSET myhash field2 "World"
     run_test "HGET" "Hello" "exact" HGET myhash field1
     run_test "HLEN" "2" "exact" HLEN myhash
-    run_test "HMGET" $'Hello\nWorld\n' "exact" HMGET myhash field1 field2 nofield
+    run_test "HMGET" $'Hello\nWorld' "exact" HMGET myhash field1 field2 nofield
     run_test "HGETALL" $'field1\nHello\nfield2\nWorld' "sorted" HGETALL myhash
     run_test "HDEL existing" "1" "exact" HDEL myhash field1
     run_test "HDEL non-existing" "0" "exact" HDEL myhash field1
